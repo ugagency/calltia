@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/discador/tick",
+      "schedule": "* * * * *"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    /* Identidade Vettia: fundo preto, texto claro. */
+    @apply bg-fundo text-texto;
+  }
+
+  h1,
+  h2,
+  h3 {
+    @apply font-titulo;
+  }
+}
