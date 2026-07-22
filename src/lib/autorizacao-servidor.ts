@@ -12,9 +12,8 @@ export function segredoConfere(recebido: string | null, esperado: string | undef
 }
 
 // Autoriza operações de servidor da Vettia (discador e controle de campanha).
-// A Vercel Cron injeta automaticamente `Authorization: Bearer <CRON_SECRET>`
-// nas chamadas agendadas quando CRON_SECRET está definido; o mesmo header é
-// usado para disparar as rotas manualmente.
+// Quem chama — o agendador externo que aciona o discador, ou um disparo
+// manual — precisa enviar `Authorization: Bearer <CRON_SECRET>`.
 export function autorizadoComoServidor(request: Request): boolean {
   const header = request.headers.get('authorization');
   const esperado = process.env.CRON_SECRET;

@@ -16,9 +16,10 @@ Cliente (parceiro)          Vettia (você)                  Externo
 ┌────────────────┐    ┌───────────────────────┐    ┌──────────────────┐
 │ Painel:        │    │ Next.js (Vercel)      │    │ Vapi             │
 │ - meu script   │───▶│ - painel multi-tenant │───▶│ (motor de voz)   │
-│ - minhas       │    │ - discador (cron)     │    │  ↓               │
-│   ligações     │◀───│ - webhook             │◀───│ trunk SIP + nº BR│
-└────────────────┘    │ Supabase (dados+RLS)  │    └──────────────────┘
+│ - minhas       │    │ - discador (acionado  │    │  ↓               │
+│   ligações     │◀───│   por agendador ext.) │◀───│ trunk SIP + nº BR│
+└────────────────┘    │ - webhook             │    └──────────────────┘
+                      │ Supabase (dados+RLS)  │
                       └───────────────────────┘
 ```
 
@@ -192,19 +193,34 @@ transcrições são gravadas normalmente, e chamadas atendidas caem em
 
 ## 5. Discador (agendamento)
 
-O discador é uma rota que executa uma passada por vez, protegida por segredo.
+O discador é a rota `/api/discador/tick`: um endpoint HTTP comum, protegido por
+segredo, que a cada chamada executa **uma** passada (no máximo uma ligação).
+Quem o aciona repetidamente é um **agendador externo**.
 
-1. Gere um segredo e coloque em `CRON_SECRET`.
-2. `vercel.json` já agenda `/api/discador/tick` a cada minuto. Ao definir
-   `CRON_SECRET` no projeto da Vercel, ela injeta automaticamente o header
-   `Authorization: Bearer <CRON_SECRET>` nas chamadas agendadas.
+> **Por que não o cron da Vercel:** o plano Hobby executa cron no máximo
+> **1×/dia**, o que não serve para discar, e um `vercel.json` com agendamento
+> por minuto faz o deploy falhar. Por isso o projeto **não tem `vercel.json`** —
+> o agendamento é externo. Se um dia migrar para o plano Pro, dá para voltar ao
+> cron nativo criando um `vercel.json` com a seção `crons`.
 
-> **Plano Hobby da Vercel executa cron no máximo 1×/dia**, o que não serve para
-> discar. Use o plano Pro, ou aponte um agendador externo (cron-job.org,
-> GitHub Actions) para a mesma URL, a cada minuto, com o header:
-> `Authorization: Bearer <CRON_SECRET>`.
+### 5.1 Configurar o agendador (cron-job.org)
 
-Teste manual:
+1. Gere um segredo e coloque em `CRON_SECRET` (nas variáveis da Vercel também).
+2. Crie a conta em [cron-job.org](https://cron-job.org) e cadastre um job:
+   - **URL:** `https://<seu-dominio>/api/discador/tick`
+   - **Método:** `GET`
+   - **Intervalo:** a cada 1 minuto
+   - **Header** (em *Advanced → Headers*):
+     `Authorization: Bearer <valor-do-CRON_SECRET>`
+3. Salve e ative.
+
+Sem esse header, o endpoint responde `401` e nenhuma ligação acontece — este é
+o erro mais comum na configuração.
+
+Deixar o job rodando o dia inteiro é seguro: fora da janela de horário da
+campanha, cada passada apenas responde `nada_a_fazer` sem discar.
+
+### 5.2 Testar
 
 ```bash
 curl -H "Authorization: Bearer $CRON_SECRET" \
@@ -221,8 +237,11 @@ Respostas possíveis: `nada_a_fazer`, `linha_ocupada`, `discou`,
 1. Importe o repositório na Vercel (framework detectado: Next.js).
 2. Em **Settings → Environment Variables**, cadastre todas as variáveis da
    tabela abaixo.
-3. Deploy. Depois, volte ao passo 4.3 e aponte o webhook do Vapi para o
-   domínio real.
+3. Deploy. Depois:
+   - volte ao passo 4.3 e aponte o webhook do Vapi para o domínio real;
+   - volte ao passo 5.1 e aponte o agendador externo para o domínio real.
+
+O plano Hobby atende — não há cron nativo em uso (ver seção 5).
 
 ### Variáveis de ambiente
 
@@ -341,9 +360,11 @@ existe apenas em pré-release. Revisite quando sair um patch estável:
 |---|---|
 | Login funciona mas aparece "acesso ainda não liberado" | Falta a linha em `profiles` (passo 3.3) |
 | Painel vazio, sem erro | RLS ativo e usuário em outro tenant, ou não há dados ainda |
+| Campanha ativa mas nenhuma ligação sai | Agendador externo não configurado ou desativado (passo 5.1); confira o histórico do job no cron-job.org |
 | Discador sempre responde `nada_a_fazer` | Fora da janela de horário, campanha não `ativa`, ou leads sem `em_fila` |
 | Discador responde `linha_ocupada` sem parar | Chamada travada; confira `leads` com `status='discado'` |
 | Ligações acontecem mas não aparecem no painel | Webhook não configurado ou secret divergente (passo 4.3) |
 | Resultado sempre "Sem interesse" | Falta a análise estruturada no assistente (passo 4.4) |
 | `401` no webhook | `VAPI_WEBHOOK_SECRET` diferente do secret configurado no Vapi |
-| `401` no discador | Header `Authorization: Bearer <CRON_SECRET>` ausente ou divergente |
+| `401` no discador | Header `Authorization: Bearer <CRON_SECRET>` ausente ou divergente no job do agendador (passo 5.1) |
+| Deploy da Vercel falha por causa de cron | Algum `vercel.json` com seção `crons` voltou ao repositório; o plano Hobby não aceita agendamento por minuto |

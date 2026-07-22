@@ -7,9 +7,11 @@ import { autorizadoComoServidor } from '@/lib/autorizacao-servidor';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
-// Discador progressivo. Chamado pela Vercel Cron a cada minuto (ver
-// vercel.json) e protegido por CRON_SECRET. Cada passada dispara no máximo
-// UMA ligação (uma por vez por linha).
+// Discador progressivo. Endpoint HTTP comum, protegido por CRON_SECRET, que
+// deve ser acionado a cada minuto por um agendador externo (cron-job.org —
+// ver SETUP.md). Não usa o cron nativo da Vercel: o plano Hobby executa no
+// máximo 1×/dia, o que não serve para discar.
+// Cada passada dispara no máximo UMA ligação (uma por vez por linha).
 export async function GET(request: Request) {
   if (!autorizadoComoServidor(request)) {
     return NextResponse.json({ erro: 'nao autorizado' }, { status: 401 });
