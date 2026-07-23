@@ -23,7 +23,14 @@ export interface TickDeps {
 
 export type TickResultado =
   | { acao: 'linha_ocupada' }
-  | { acao: 'nada_a_fazer'; motivo: 'sem_campanha_elegivel' | 'sem_lead' }
+  | {
+      acao: 'nada_a_fazer';
+      motivo: 'sem_campanha_elegivel' | 'sem_lead';
+      // Por que cada campanha ativa foi filtrada (presente só em
+      // sem_campanha_elegivel): separa "query voltou vazia" de "veio mas
+      // caiu no filtro" (sem assistente / fora da janela).
+      detalhe?: unknown;
+    }
   | { acao: 'lead_tomado' }
   | { acao: 'discou'; leadId: string; campaignId: string; chamadaExternaId: string }
   | { acao: 'falha_ao_discar'; leadId: string; erro: string }
@@ -74,7 +81,22 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
   const elegiveis = campanhas.filter(
     (c) => c.assistente_id && dentroDaJanela(agora, c.janela_horario),
   );
-  if (elegiveis.length === 0) return { acao: 'nada_a_fazer', motivo: 'sem_campanha_elegivel' };
+  if (elegiveis.length === 0) {
+    // Visibilidade: separa "query voltou vazia" de "campanha veio mas foi
+    // filtrada" (sem assistente ou fora da janela), com o porquê de cada uma.
+    const detalhe = {
+      retornadasPelaQuery: campanhas.length,
+      agoraUtc: agora.toISOString(),
+      campanhas: campanhas.map((c) => ({
+        id: c.id,
+        temAssistente: !!c.assistente_id,
+        dentroDaJanela: dentroDaJanela(agora, c.janela_horario),
+        janela: c.janela_horario,
+      })),
+    };
+    console.warn('[discador] nenhuma campanha elegivel', detalhe);
+    return { acao: 'nada_a_fazer', motivo: 'sem_campanha_elegivel', detalhe };
+  }
 
   // 4. Pega UM lead elegível (na fila, com tentativas restantes e cujo
   //    reagendamento já venceu). Mais antigos / sem agendamento primeiro.
