@@ -55,6 +55,17 @@ export interface DiagnosticoTick {
   // filtro vs. tipo de coluna). Leitura em cada probe: count = linhas
   // encontradas, erro = mensagem do PostgREST se houver.
   probes: { nome: string; count: number | null; erro: string | null }[];
+  // DIAGNÓSTICO TEMPORÁRIO: probes que buscam o CORPO das linhas (sem head),
+  // reproduzindo o passo 3. count acima é só contagem; o problema aparece só
+  // ao trazer as linhas de fato. status = HTTP do PostgREST; chaves = colunas
+  // da 1ª linha retornada (null se não veio linha).
+  probesBody: {
+    nome: string;
+    dataLen: number | null;
+    status: number | null;
+    erro: string | null;
+    chaves: string[] | null;
+  }[];
 }
 
 export type TickResultado =
@@ -133,6 +144,39 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
     // filtro por uuid (coluna não-enum): filtrar em geral funciona?
     await contar('eq_id', db.from('campaigns').select('id', { count: 'exact', head: true }).eq('id', primeiraId ?? '')),
   ];
+  // Todos os probes acima usam head:true (count puro, sem serializar linha).
+  // Todos deram 1. Mas o passo 3 busca o CORPO (head:false, select '*') e dá
+  // 0. Hipótese: contar não exige serializar as colunas da linha; trazer o
+  // corpo exige, e alguma coluna tem valor que quebra a serialização (jsonb
+  // malformado, timestamp fora de faixa, etc.) — o que faria a linha "sumir"
+  // só quando pedida de verdade. Testa isso variando as colunas buscadas.
+  const buscarCorpo = async (
+    nome: string,
+    q: PromiseLike<{
+      data: unknown;
+      error: { message?: string } | null;
+      status: number;
+    }>,
+  ) => {
+    const r = await q;
+    const primeira = Array.isArray(r.data) ? (r.data[0] as Record<string, unknown>) : null;
+    return {
+      nome,
+      dataLen: Array.isArray(r.data) ? r.data.length : null,
+      status: r.status ?? null,
+      erro: r.error?.message ?? null,
+      chaves: primeira ? Object.keys(primeira) : null,
+    };
+  };
+  const probesBody = [
+    await buscarCorpo('so_id', db.from('campaigns').select('id').eq('status', 'ativa')),
+    await buscarCorpo('id_status', db.from('campaigns').select('id, status').eq('status', 'ativa')),
+    await buscarCorpo('id_status_assistente', db.from('campaigns').select('id, status, assistente_id').eq('status', 'ativa')),
+    await buscarCorpo('id_status_janela', db.from('campaigns').select('id, status, janela_horario').eq('status', 'ativa')),
+    await buscarCorpo('id_status_script', db.from('campaigns').select('id, status, script_id').eq('status', 'ativa')),
+    await buscarCorpo('id_status_criado', db.from('campaigns').select('id, status, criado_em').eq('status', 'ativa')),
+    await buscarCorpo('estrela_completo', db.from('campaigns').select('*').eq('status', 'ativa')),
+  ];
 
   // 3. Campanhas ativas, dentro da janela, com assistente já criado.
   const campanhasResp = await db.from('campaigns').select('*').eq('status', 'ativa');
@@ -174,6 +218,7 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
       : null,
     casaStatusAtivaEmJs: todasCampanhas.filter((c) => c.status === 'ativa').length,
     probes,
+    probesBody,
   };
 
   const lead = leads[0];
