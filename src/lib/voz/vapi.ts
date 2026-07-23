@@ -93,9 +93,12 @@ export class VapiMotor implements MotorDeVoz {
       assistantId: assistenteId,
       phoneNumberId,
       customer: { number: telefone },
-      // O Vapi ecoa assistantOverrides.metadata de volta no webhook de fim
-      // de chamada (message.call.metadata) — é assim que correlacionamos o
-      // retorno ao lead/campanha que originou a ligação.
+      // Metadata de correlação (leadId/campaignId/tenantId). Vai no `metadata`
+      // de TOPO do corpo: é ele que o Vapi ecoa em `message.call.metadata` no
+      // webhook. `assistantOverrides.metadata` grava no assistente e NÃO volta
+      // em call.metadata — mandamos nos dois por segurança, e o parser do
+      // webhook procura em ambos os locais.
+      metadata: metadados,
       assistantOverrides: { metadata: metadados },
     };
 
@@ -113,7 +116,10 @@ export class VapiMotor implements MotorDeVoz {
 
     const chamada = mensagem.call ?? {};
     const artifact = mensagem.artifact ?? {};
-    const metadados = chamada.metadata ?? {};
+    // O metadata de correlação pode aparecer em locais diferentes conforme a
+    // versão da API do Vapi. Procura em todos os candidatos plausíveis, na
+    // ordem mais provável, e usa o primeiro que tiver leadId.
+    const metadados = extrairMetadados(mensagem, chamada);
 
     if (!metadados.leadId) {
       // Fim de chamada SEM metadados de correlação. Diferente de um evento
@@ -123,6 +129,18 @@ export class VapiMotor implements MotorDeVoz {
       // assistente disparado fora do discador. Registra alto para não sumir
       // silenciosamente; o id abaixo permite achar a chamada no painel do
       // motor de voz.
+      //
+      // DIAGNÓSTICO TEMPORÁRIO: loga o payload bruto (recortado) para ver onde
+      // o Vapi realmente coloca o metadata nesta versão da API — a doc não é
+      // confiável. Remover quando a correlação estiver estável.
+      console.warn('[vapi] webhook sem correlacao — payload bruto para diagnostico', {
+        chaves_message: Object.keys(mensagem ?? {}),
+        chaves_call: Object.keys(chamada ?? {}),
+        call_metadata: chamada.metadata ?? null,
+        call_assistantOverrides_metadata: chamada.assistantOverrides?.metadata ?? null,
+        message_metadata: mensagem.metadata ?? null,
+        message_assistantOverrides_metadata: mensagem.assistantOverrides?.metadata ?? null,
+      });
       console.warn(
         '[vapi] fim de chamada sem metadados de correlacao; nao foi associada a nenhum lead',
         {
@@ -172,6 +190,24 @@ export class VapiMotor implements MotorDeVoz {
       resultado: statusChamada === 'atendida' ? extrairResultado(mensagem) : null,
     };
   }
+}
+
+// Procura o metadata de correlação nos locais onde o Vapi pode ecoá-lo,
+// conforme a versão da API. Retorna o primeiro objeto que tenha leadId; se
+// nenhum tiver, retorna o primeiro não-vazio (para o log de diagnóstico) ou
+// {}. Enviamos o metadata tanto no topo do /call (→ call.metadata) quanto em
+// assistantOverrides.metadata, então cobrimos ambos aqui.
+function extrairMetadados(mensagem: any, chamada: any): any {
+  const candidatos = [
+    chamada?.metadata,
+    chamada?.assistantOverrides?.metadata,
+    mensagem?.metadata,
+    mensagem?.assistantOverrides?.metadata,
+  ];
+  for (const c of candidatos) {
+    if (c && typeof c === 'object' && c.leadId) return c;
+  }
+  return candidatos.find((c) => c && typeof c === 'object') ?? {};
 }
 
 // Extrai o resultado de negócio da análise estruturada do Vapi
