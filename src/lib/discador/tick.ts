@@ -65,6 +65,7 @@ export interface DiagnosticoTick {
     status: number | null;
     erro: string | null;
     chaves: string[] | null;
+    amostra: Record<string, unknown> | null;
   }[];
 }
 
@@ -166,11 +167,19 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
       status: r.status ?? null,
       erro: r.error?.message ?? null,
       chaves: primeira ? Object.keys(primeira) : null,
+      // Valor cru da 1ª linha, quando ela veio. Para as colunas suspeitas
+      // (tenant_id, nome, objetivo) mostra o conteúdo — a culpada é a que
+      // fizer a linha sumir (dataLen 0), as demais aparecem aqui.
+      amostra: primeira ?? null,
     };
   };
   const probesBody = [
     await buscarCorpo('so_id', db.from('campaigns').select('id').eq('status', 'ativa')),
     await buscarCorpo('id_status', db.from('campaigns').select('id, status').eq('status', 'ativa')),
+    // As três colunas que `*` inclui e que ainda não foram isoladas.
+    await buscarCorpo('id_tenant', db.from('campaigns').select('id, tenant_id').eq('status', 'ativa')),
+    await buscarCorpo('id_nome', db.from('campaigns').select('id, nome').eq('status', 'ativa')),
+    await buscarCorpo('id_objetivo', db.from('campaigns').select('id, objetivo').eq('status', 'ativa')),
     await buscarCorpo('id_status_assistente', db.from('campaigns').select('id, status, assistente_id').eq('status', 'ativa')),
     await buscarCorpo('id_status_janela', db.from('campaigns').select('id, status, janela_horario').eq('status', 'ativa')),
     await buscarCorpo('id_status_script', db.from('campaigns').select('id, status, script_id').eq('status', 'ativa')),
