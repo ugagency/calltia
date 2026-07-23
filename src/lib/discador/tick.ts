@@ -36,6 +36,14 @@ export interface DiagnosticoTick {
   // ainda que o login do painel funcione (login usa a anon key, outra
   // credencial). Remover quando o diagnóstico terminar.
   totalProfilesViaAdmin: number | null;
+  // DIAGNÓSTICO TEMPORÁRIO: qual projeto Supabase a app está falando (host da
+  // NEXT_PUBLIC_SUPABASE_URL). Compare com a URL do projeto onde você criou a
+  // campanha por SQL — se diferirem, a Vercel aponta para outro banco.
+  supabaseHost: string | null;
+  // DIAGNÓSTICO TEMPORÁRIO: todas as campanhas que o client admin enxerga,
+  // sem filtro de status. Se vier [], o banco que a app vê não tem a campanha
+  // (projeto errado); se vier com status != 'ativa', o /iniciar não a ativou.
+  todasCampanhas: { id: string; status: string }[];
 }
 
 export type TickResultado =
@@ -83,6 +91,16 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
     .select('*', { count: 'exact', head: true });
   const totalProfilesViaAdmin = profilesResp.error ? null : (profilesResp.count ?? 0);
 
+  // DIAGNÓSTICO TEMPORÁRIO: host do projeto Supabase + todas as campanhas.
+  let supabaseHost: string | null = null;
+  try {
+    supabaseHost = new URL(process.env.NEXT_PUBLIC_SUPABASE_URL ?? '').host;
+  } catch {
+    supabaseHost = null;
+  }
+  const todasResp = await db.from('campaigns').select('id, status');
+  const todasCampanhas = (todasResp.data ?? []) as { id: string; status: string }[];
+
   // 3. Campanhas ativas, dentro da janela, com assistente já criado.
   const campanhasResp = await db.from('campaigns').select('*').eq('status', 'ativa');
   if (campanhasResp.error) return erroTick('consultar_campanhas', campanhasResp.error);
@@ -116,6 +134,8 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
     campanhasElegiveis: elegiveis.length,
     leadsEncontrados: leads.length,
     totalProfilesViaAdmin,
+    supabaseHost,
+    todasCampanhas,
   };
 
   const lead = leads[0];
