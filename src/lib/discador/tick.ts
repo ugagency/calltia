@@ -28,6 +28,14 @@ export interface DiagnosticoTick {
   campanhasAtivas: number;
   campanhasElegiveis: number;
   leadsEncontrados: number;
+  // DIAGNÓSTICO TEMPORÁRIO: prova se criarClienteAdmin() é mesmo service-role.
+  // `profiles` só tem policy de SELECT para o próprio usuário
+  // (user_id = auth.uid()). O discador roda sem sessão: com a chave
+  // service-role (ignora RLS) este count vem igual ao total real de profiles;
+  // se vier 0, a chave configurada é a anon (ou outra sem service-role),
+  // ainda que o login do painel funcione (login usa a anon key, outra
+  // credencial). Remover quando o diagnóstico terminar.
+  totalProfilesViaAdmin: number | null;
 }
 
 export type TickResultado =
@@ -69,6 +77,12 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
   if (emVoo.error) return erroTick('consultar_em_voo', emVoo.error);
   if (emVoo.data && emVoo.data.length > 0) return { acao: 'linha_ocupada' };
 
+  // DIAGNÓSTICO TEMPORÁRIO: conta profiles sem filtro. Ver DiagnosticoTick.
+  const profilesResp = await db
+    .from('profiles')
+    .select('*', { count: 'exact', head: true });
+  const totalProfilesViaAdmin = profilesResp.error ? null : (profilesResp.count ?? 0);
+
   // 3. Campanhas ativas, dentro da janela, com assistente já criado.
   const campanhasResp = await db.from('campaigns').select('*').eq('status', 'ativa');
   if (campanhasResp.error) return erroTick('consultar_campanhas', campanhasResp.error);
@@ -101,6 +115,7 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
     campanhasAtivas: campanhas.length,
     campanhasElegiveis: elegiveis.length,
     leadsEncontrados: leads.length,
+    totalProfilesViaAdmin,
   };
 
   const lead = leads[0];
