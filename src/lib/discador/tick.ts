@@ -44,6 +44,12 @@ export interface DiagnosticoTick {
   // sem filtro de status. Se vier [], o banco que a app vê não tem a campanha
   // (projeto errado); se vier com status != 'ativa', o /iniciar não a ativou.
   todasCampanhas: { id: string; status: string }[];
+  // DIAGNÓSTICO TEMPORÁRIO: bytes crus do status da 1ª campanha. Se .eq
+  // ('status','ativa') volta 0 mas a lista mostra "ativa", o valor guardado
+  // tem caractere invisível — os char codes revelam. `casaStatusAtivaEmJs`
+  // repete o filtro em JS: se também der 0, o valor não é a string 'ativa'.
+  statusPrimeiraCharCodes: number[] | null;
+  casaStatusAtivaEmJs: number;
 }
 
 export type TickResultado =
@@ -136,6 +142,10 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
     totalProfilesViaAdmin,
     supabaseHost,
     todasCampanhas,
+    statusPrimeiraCharCodes: todasCampanhas[0]
+      ? Array.from(todasCampanhas[0].status, (ch) => ch.charCodeAt(0))
+      : null,
+    casaStatusAtivaEmJs: todasCampanhas.filter((c) => c.status === 'ativa').length,
   };
 
   const lead = leads[0];
