@@ -50,6 +50,11 @@ export interface DiagnosticoTick {
   // repete o filtro em JS: se também der 0, o valor não é a string 'ativa'.
   statusPrimeiraCharCodes: number[] | null;
   casaStatusAtivaEmJs: number;
+  // DIAGNÓSTICO TEMPORÁRIO: o valor é 'ativa' limpo e o JS acha, mas o
+  // PostgREST não. Isola a causa variando UMA coisa por vez (select vs.
+  // filtro vs. tipo de coluna). Leitura em cada probe: count = linhas
+  // encontradas, erro = mensagem do PostgREST se houver.
+  probes: { nome: string; count: number | null; erro: string | null }[];
 }
 
 export type TickResultado =
@@ -107,6 +112,28 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
   const todasResp = await db.from('campaigns').select('id, status');
   const todasCampanhas = (todasResp.data ?? []) as { id: string; status: string }[];
 
+  // DIAGNÓSTICO TEMPORÁRIO: isola por que .eq('status','ativa') volta 0.
+  const primeiraId = todasCampanhas[0]?.id ?? null;
+  const contar = async (
+    nome: string,
+    q: PromiseLike<{ count: number | null; error: { message?: string } | null }>,
+  ) => {
+    const r = await q;
+    return { nome, count: r.error ? null : (r.count ?? 0), erro: r.error?.message ?? null };
+  };
+  const probes = [
+    // select * sem filtro: `select *` sozinho funciona?
+    await contar('select_star_sem_filtro', db.from('campaigns').select('*', { count: 'exact', head: true })),
+    // reproduz a query que falha (select * + filtro de enum).
+    await contar('eq_status_select_star', db.from('campaigns').select('*', { count: 'exact', head: true }).eq('status', 'ativa')),
+    // mesmo filtro de enum, mas select mínimo: isola o efeito do `select *`.
+    await contar('eq_status_select_id', db.from('campaigns').select('id', { count: 'exact', head: true }).eq('status', 'ativa')),
+    // `in` em vez de `eq` sobre o mesmo enum.
+    await contar('in_status_ativa', db.from('campaigns').select('id', { count: 'exact', head: true }).in('status', ['ativa'])),
+    // filtro por uuid (coluna não-enum): filtrar em geral funciona?
+    await contar('eq_id', db.from('campaigns').select('id', { count: 'exact', head: true }).eq('id', primeiraId ?? '')),
+  ];
+
   // 3. Campanhas ativas, dentro da janela, com assistente já criado.
   const campanhasResp = await db.from('campaigns').select('*').eq('status', 'ativa');
   if (campanhasResp.error) return erroTick('consultar_campanhas', campanhasResp.error);
@@ -146,6 +173,7 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
       ? Array.from(todasCampanhas[0].status, (ch) => ch.charCodeAt(0))
       : null,
     casaStatusAtivaEmJs: todasCampanhas.filter((c) => c.status === 'ativa').length,
+    probes,
   };
 
   const lead = leads[0];
