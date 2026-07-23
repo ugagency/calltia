@@ -12,6 +12,19 @@ function hhmmParaMin(hhmm: string): number {
   return (h || 0) * 60 + (m || 0);
 }
 
+// Normaliza os dias da janela para um array de números. Aceita tanto o
+// formato do sistema (array [0,1,2,...]) quanto uma string separada por
+// espaço ou vírgula ("0 1 2 3 4 5 6"), que aparece em campanhas criadas à
+// mão. Ignora entradas não numéricas.
+function normalizarDias(dias: unknown): number[] {
+  const bruto = Array.isArray(dias)
+    ? dias
+    : typeof dias === 'string'
+      ? dias.split(/[\s,]+/).filter((s) => s !== '')
+      : [];
+  return bruto.map(Number).filter((n) => Number.isInteger(n));
+}
+
 // Componentes de calendário/relógio de `utc` como observados em São Paulo.
 function componentesSP(utc: Date): { dia: number; minutoDoDia: number } {
   const deslocado = new Date(utc.getTime() + SP_OFFSET_MIN * 60000);
@@ -22,14 +35,14 @@ function componentesSP(utc: Date): { dia: number; minutoDoDia: number } {
 }
 
 function janelaValida(janela: JanelaHorario | null | undefined): janela is JanelaHorario {
-  return !!janela && Array.isArray(janela.dias) && !!janela.inicio && !!janela.fim;
+  return !!janela && janela.dias != null && !!janela.inicio && !!janela.fim;
 }
 
 // `agora` cai dentro da janela permitida (dia da semana + faixa de hora)?
 export function dentroDaJanela(agora: Date, janela: JanelaHorario): boolean {
   if (!janelaValida(janela)) return false;
   const { dia, minutoDoDia } = componentesSP(agora);
-  if (!janela.dias.map(Number).includes(dia)) return false;
+  if (!normalizarDias(janela.dias).includes(dia)) return false;
   return minutoDoDia >= hhmmParaMin(janela.inicio) && minutoDoDia < hhmmParaMin(janela.fim);
 }
 
@@ -41,7 +54,7 @@ export function proximoHorarioValido(apartir: Date, janela: JanelaHorario): Date
   if (!janelaValida(janela)) return apartir;
   const inicioMin = hhmmParaMin(janela.inicio);
   const fimMin = hhmmParaMin(janela.fim);
-  const dias = janela.dias.map(Number);
+  const dias = normalizarDias(janela.dias);
 
   for (let i = 0; i < 14; i++) {
     const base = new Date(apartir.getTime() + i * 24 * 60 * 60000);

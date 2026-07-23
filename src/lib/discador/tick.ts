@@ -8,11 +8,28 @@ export const TIMEOUT_DISCAGEM_MIN = 10; // sem retorno do webhook após isso ⇒
 export const ATRASO_RETRY_HORAS = 3; // reagendamento entre tentativas (horários diferentes)
 export const MAX_TENTATIVAS = 3;
 
+// Listas de colunas explícitas em vez de select('*'). Além de boa prática
+// (traz só o necessário), evita depender do comportamento do PostgREST com o
+// token '*', que numa base com schema recriado à mão pode divergir da tabela.
+const COLUNAS_CAMPANHA = 'id, status, assistente_id, janela_horario';
+const COLUNAS_LEAD =
+  'id, tenant_id, campaign_id, telefone, status, tentativas, proximo_contato_em, ultima_discagem_em, chamada_atual_id';
+
 export interface TickDeps {
   db: SupabaseClient;
   motor: MotorDeVoz;
   agora: Date;
 }
+
+export type TickResultado =
+  | { acao: 'linha_ocupada' }
+  | { acao: 'nada_a_fazer'; motivo: 'sem_campanha_elegivel' | 'sem_lead' }
+  | { acao: 'lead_tomado' }
+  | { acao: 'discou'; leadId: string; campaignId: string; chamadaExternaId: string }
+  | { acao: 'falha_ao_discar'; leadId: string; erro: string }
+  // Uma consulta ao Supabase falhou. Antes esse erro era engolido e virava
+  // 'nada_a_fazer' silencioso (mesmo antipadrão corrigido no webhook).
+  | { acao: 'erro'; etapa: string; erro: string };
 
 // Loga e devolve um erro de consulta como resultado do tick, para que a causa
 // apareça na resposta HTTP em vez de virar 'nada_a_fazer' silencioso.
@@ -20,64 +37,6 @@ function erroTick(etapa: string, erro: { message?: string }): TickResultado {
   console.error('[discador] falha na etapa', etapa, erro);
   return { acao: 'erro', etapa, erro: erro?.message ?? 'erro desconhecido' };
 }
-
-// Diagnóstico de uma passada. Vai junto na resposta para tornar visível por
-// que o discador não discou (as duas causas de 'nada_a_fazer' — nenhuma
-// campanha elegível vs. nenhum lead — eram indistinguíveis antes disso).
-export interface DiagnosticoTick {
-  campanhasAtivas: number;
-  campanhasElegiveis: number;
-  leadsEncontrados: number;
-  // DIAGNÓSTICO TEMPORÁRIO: prova se criarClienteAdmin() é mesmo service-role.
-  // `profiles` só tem policy de SELECT para o próprio usuário
-  // (user_id = auth.uid()). O discador roda sem sessão: com a chave
-  // service-role (ignora RLS) este count vem igual ao total real de profiles;
-  // se vier 0, a chave configurada é a anon (ou outra sem service-role),
-  // ainda que o login do painel funcione (login usa a anon key, outra
-  // credencial). Remover quando o diagnóstico terminar.
-  totalProfilesViaAdmin: number | null;
-  // DIAGNÓSTICO TEMPORÁRIO: qual projeto Supabase a app está falando (host da
-  // NEXT_PUBLIC_SUPABASE_URL). Compare com a URL do projeto onde você criou a
-  // campanha por SQL — se diferirem, a Vercel aponta para outro banco.
-  supabaseHost: string | null;
-  // DIAGNÓSTICO TEMPORÁRIO: todas as campanhas que o client admin enxerga,
-  // sem filtro de status. Se vier [], o banco que a app vê não tem a campanha
-  // (projeto errado); se vier com status != 'ativa', o /iniciar não a ativou.
-  todasCampanhas: { id: string; status: string }[];
-  // DIAGNÓSTICO TEMPORÁRIO: bytes crus do status da 1ª campanha. Se .eq
-  // ('status','ativa') volta 0 mas a lista mostra "ativa", o valor guardado
-  // tem caractere invisível — os char codes revelam. `casaStatusAtivaEmJs`
-  // repete o filtro em JS: se também der 0, o valor não é a string 'ativa'.
-  statusPrimeiraCharCodes: number[] | null;
-  casaStatusAtivaEmJs: number;
-  // DIAGNÓSTICO TEMPORÁRIO: o valor é 'ativa' limpo e o JS acha, mas o
-  // PostgREST não. Isola a causa variando UMA coisa por vez (select vs.
-  // filtro vs. tipo de coluna). Leitura em cada probe: count = linhas
-  // encontradas, erro = mensagem do PostgREST se houver.
-  probes: { nome: string; count: number | null; erro: string | null }[];
-  // DIAGNÓSTICO TEMPORÁRIO: probes que buscam o CORPO das linhas (sem head),
-  // reproduzindo o passo 3. count acima é só contagem; o problema aparece só
-  // ao trazer as linhas de fato. status = HTTP do PostgREST; chaves = colunas
-  // da 1ª linha retornada (null se não veio linha).
-  probesBody: {
-    nome: string;
-    dataLen: number | null;
-    status: number | null;
-    erro: string | null;
-    chaves: string[] | null;
-    amostra: Record<string, unknown> | null;
-  }[];
-}
-
-export type TickResultado =
-  | { acao: 'linha_ocupada' }
-  | { acao: 'nada_a_fazer'; motivo: 'sem_campanha_elegivel' | 'sem_lead'; diagnostico: DiagnosticoTick }
-  | { acao: 'lead_tomado' }
-  | { acao: 'discou'; leadId: string; campaignId: string; chamadaExternaId: string }
-  | { acao: 'falha_ao_discar'; leadId: string; erro: string }
-  // Uma consulta ao Supabase falhou. Antes esse erro era engolido e virava
-  // 'nada_a_fazer' silencioso (mesmo antipadrão corrigido no webhook).
-  | { acao: 'erro'; etapa: string; erro: string };
 
 // Uma passada do discador. Regra central (Anatel / discagem progressiva):
 // UMA ligação por vez por linha.
@@ -108,136 +67,32 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
   if (emVoo.error) return erroTick('consultar_em_voo', emVoo.error);
   if (emVoo.data && emVoo.data.length > 0) return { acao: 'linha_ocupada' };
 
-  // DIAGNÓSTICO TEMPORÁRIO: conta profiles sem filtro. Ver DiagnosticoTick.
-  const profilesResp = await db
-    .from('profiles')
-    .select('*', { count: 'exact', head: true });
-  const totalProfilesViaAdmin = profilesResp.error ? null : (profilesResp.count ?? 0);
-
-  // DIAGNÓSTICO TEMPORÁRIO: host do projeto Supabase + todas as campanhas.
-  let supabaseHost: string | null = null;
-  try {
-    supabaseHost = new URL(process.env.NEXT_PUBLIC_SUPABASE_URL ?? '').host;
-  } catch {
-    supabaseHost = null;
-  }
-  const todasResp = await db.from('campaigns').select('id, status');
-  const todasCampanhas = (todasResp.data ?? []) as { id: string; status: string }[];
-
-  // DIAGNÓSTICO TEMPORÁRIO: isola por que .eq('status','ativa') volta 0.
-  const primeiraId = todasCampanhas[0]?.id ?? null;
-  const contar = async (
-    nome: string,
-    q: PromiseLike<{ count: number | null; error: { message?: string } | null }>,
-  ) => {
-    const r = await q;
-    return { nome, count: r.error ? null : (r.count ?? 0), erro: r.error?.message ?? null };
-  };
-  const probes = [
-    // select * sem filtro: `select *` sozinho funciona?
-    await contar('select_star_sem_filtro', db.from('campaigns').select('*', { count: 'exact', head: true })),
-    // reproduz a query que falha (select * + filtro de enum).
-    await contar('eq_status_select_star', db.from('campaigns').select('*', { count: 'exact', head: true }).eq('status', 'ativa')),
-    // mesmo filtro de enum, mas select mínimo: isola o efeito do `select *`.
-    await contar('eq_status_select_id', db.from('campaigns').select('id', { count: 'exact', head: true }).eq('status', 'ativa')),
-    // `in` em vez de `eq` sobre o mesmo enum.
-    await contar('in_status_ativa', db.from('campaigns').select('id', { count: 'exact', head: true }).in('status', ['ativa'])),
-    // filtro por uuid (coluna não-enum): filtrar em geral funciona?
-    await contar('eq_id', db.from('campaigns').select('id', { count: 'exact', head: true }).eq('id', primeiraId ?? '')),
-  ];
-  // Todos os probes acima usam head:true (count puro, sem serializar linha).
-  // Todos deram 1. Mas o passo 3 busca o CORPO (head:false, select '*') e dá
-  // 0. Hipótese: contar não exige serializar as colunas da linha; trazer o
-  // corpo exige, e alguma coluna tem valor que quebra a serialização (jsonb
-  // malformado, timestamp fora de faixa, etc.) — o que faria a linha "sumir"
-  // só quando pedida de verdade. Testa isso variando as colunas buscadas.
-  const buscarCorpo = async (
-    nome: string,
-    q: PromiseLike<{
-      data: unknown;
-      error: { message?: string } | null;
-      status: number;
-    }>,
-  ) => {
-    const r = await q;
-    const primeira = Array.isArray(r.data) ? (r.data[0] as Record<string, unknown>) : null;
-    return {
-      nome,
-      dataLen: Array.isArray(r.data) ? r.data.length : null,
-      status: r.status ?? null,
-      erro: r.error?.message ?? null,
-      chaves: primeira ? Object.keys(primeira) : null,
-      // Valor cru da 1ª linha, quando ela veio. Para as colunas suspeitas
-      // (tenant_id, nome, objetivo) mostra o conteúdo — a culpada é a que
-      // fizer a linha sumir (dataLen 0), as demais aparecem aqui.
-      amostra: primeira ?? null,
-    };
-  };
-  const probesBody = [
-    await buscarCorpo('so_id', db.from('campaigns').select('id').eq('status', 'ativa')),
-    await buscarCorpo('id_status', db.from('campaigns').select('id, status').eq('status', 'ativa')),
-    // As três colunas que `*` inclui e que ainda não foram isoladas.
-    await buscarCorpo('id_tenant', db.from('campaigns').select('id, tenant_id').eq('status', 'ativa')),
-    await buscarCorpo('id_nome', db.from('campaigns').select('id, nome').eq('status', 'ativa')),
-    await buscarCorpo('id_objetivo', db.from('campaigns').select('id, objetivo').eq('status', 'ativa')),
-    await buscarCorpo('id_status_assistente', db.from('campaigns').select('id, status, assistente_id').eq('status', 'ativa')),
-    await buscarCorpo('id_status_janela', db.from('campaigns').select('id, status, janela_horario').eq('status', 'ativa')),
-    await buscarCorpo('id_status_script', db.from('campaigns').select('id, status, script_id').eq('status', 'ativa')),
-    await buscarCorpo('id_status_criado', db.from('campaigns').select('id, status, criado_em').eq('status', 'ativa')),
-    await buscarCorpo('estrela_completo', db.from('campaigns').select('*').eq('status', 'ativa')),
-  ];
-
   // 3. Campanhas ativas, dentro da janela, com assistente já criado.
-  const campanhasResp = await db.from('campaigns').select('*').eq('status', 'ativa');
+  const campanhasResp = await db.from('campaigns').select(COLUNAS_CAMPANHA).eq('status', 'ativa');
   if (campanhasResp.error) return erroTick('consultar_campanhas', campanhasResp.error);
   const campanhas = (campanhasResp.data ?? []) as Campaign[];
   const elegiveis = campanhas.filter(
     (c) => c.assistente_id && dentroDaJanela(agora, c.janela_horario),
   );
+  if (elegiveis.length === 0) return { acao: 'nada_a_fazer', motivo: 'sem_campanha_elegivel' };
 
   // 4. Pega UM lead elegível (na fila, com tentativas restantes e cujo
   //    reagendamento já venceu). Mais antigos / sem agendamento primeiro.
   const agoraIso = agora.toISOString();
-  let leads: Lead[] = [];
-  if (elegiveis.length > 0) {
-    const idsCampanha = elegiveis.map((c) => c.id);
-    const leadsResp = await db
-      .from('leads')
-      .select('*')
-      .in('campaign_id', idsCampanha)
-      .eq('status', 'em_fila')
-      .lt('tentativas', MAX_TENTATIVAS)
-      .or(`proximo_contato_em.is.null,proximo_contato_em.lte.${agoraIso}`)
-      .order('proximo_contato_em', { ascending: true, nullsFirst: true })
-      .order('criado_em', { ascending: true })
-      .limit(1);
-    if (leadsResp.error) return erroTick('consultar_leads', leadsResp.error);
-    leads = (leadsResp.data ?? []) as Lead[];
-  }
-
-  const diagnostico: DiagnosticoTick = {
-    campanhasAtivas: campanhas.length,
-    campanhasElegiveis: elegiveis.length,
-    leadsEncontrados: leads.length,
-    totalProfilesViaAdmin,
-    supabaseHost,
-    todasCampanhas,
-    statusPrimeiraCharCodes: todasCampanhas[0]
-      ? Array.from(todasCampanhas[0].status, (ch) => ch.charCodeAt(0))
-      : null,
-    casaStatusAtivaEmJs: todasCampanhas.filter((c) => c.status === 'ativa').length,
-    probes,
-    probesBody,
-  };
-
-  const lead = leads[0];
-  if (!lead) {
-    return {
-      acao: 'nada_a_fazer',
-      motivo: elegiveis.length === 0 ? 'sem_campanha_elegivel' : 'sem_lead',
-      diagnostico,
-    };
-  }
+  const idsCampanha = elegiveis.map((c) => c.id);
+  const leadsResp = await db
+    .from('leads')
+    .select(COLUNAS_LEAD)
+    .in('campaign_id', idsCampanha)
+    .eq('status', 'em_fila')
+    .lt('tentativas', MAX_TENTATIVAS)
+    .or(`proximo_contato_em.is.null,proximo_contato_em.lte.${agoraIso}`)
+    .order('proximo_contato_em', { ascending: true, nullsFirst: true })
+    .order('criado_em', { ascending: true })
+    .limit(1);
+  if (leadsResp.error) return erroTick('consultar_leads', leadsResp.error);
+  const lead = (leadsResp.data ?? [])[0] as Lead | undefined;
+  if (!lead) return { acao: 'nada_a_fazer', motivo: 'sem_lead' };
 
   // 5. Reivindica o lead de forma atômica (trava otimista em status='em_fila').
   //    Se outra passada o pegou primeiro, o update não afeta linhas.
@@ -329,7 +184,7 @@ async function varrerChamadasTravadas(deps: TickDeps): Promise<void> {
 
   const { data: travados } = await db
     .from('leads')
-    .select('*')
+    .select(COLUNAS_LEAD)
     .eq('status', 'discado')
     .lte('ultima_discagem_em', limite);
 

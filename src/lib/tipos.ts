@@ -10,8 +10,10 @@ export type MotorVoz = 'vapi' | 'pipecat';
 
 // janela_horario (jsonb). dias segue a convenção de Date.getUTCDay():
 // 0=domingo .. 6=sábado. Horários em America/Sao_Paulo.
+// O formato do sistema é array ([1,2,3,4,5]); campanhas criadas à mão podem
+// trazer uma string ("1 2 3 4 5"), que o discador normaliza (ver janela.ts).
 export interface JanelaHorario {
-  dias: number[];
+  dias: number[] | string;
   inicio: string; // "HH:MM"
   fim: string; // "HH:MM"
 }
