@@ -77,7 +77,37 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
   // 3. Campanhas ativas, dentro da janela, com assistente já criado.
   const campanhasResp = await db.from('campaigns').select(COLUNAS_CAMPANHA).eq('status', 'ativa');
   if (campanhasResp.error) return erroTick('consultar_campanhas', campanhasResp.error);
-  const campanhas = (campanhasResp.data ?? []) as Campaign[];
+  let campanhas = (campanhasResp.data ?? []) as Campaign[];
+
+  // WORKAROUND (PostgREST inconsistente): nesta base já foi observado o
+  // PostgREST responder 0 linhas para esta query enquanto o count e queries
+  // com menos colunas retornam a linha (cache/planos velhos após migrations
+  // reaplicadas à mão; correção definitiva = restart do projeto Supabase).
+  // Se a query normal vier vazia, refaz a leitura por formas comprovadamente
+  // funcionais: lista id+status sem filtro e busca cada campanha ativa por id.
+  // Quando a infraestrutura está sã, a query normal retorna e isto nunca roda.
+  if (campanhas.length === 0) {
+    const listaResp = await db.from('campaigns').select('id, status');
+    const ativasIds = ((listaResp.data ?? []) as { id: string; status: string }[])
+      .filter((c) => c.status === 'ativa')
+      .map((c) => c.id);
+    if (ativasIds.length > 0) {
+      console.warn(
+        '[discador] WORKAROUND: query normal de campanhas voltou vazia, mas existem ativas; relendo por id. Reinicie o projeto Supabase para corrigir a causa raiz.',
+        { ativasIds },
+      );
+      const relidas: Campaign[] = [];
+      for (const cid of ativasIds) {
+        const uma = await db
+          .from('campaigns')
+          .select('id, assistente_id, janela_horario')
+          .eq('id', cid)
+          .maybeSingle();
+        if (uma.data) relidas.push({ ...(uma.data as Campaign), status: 'ativa' });
+      }
+      campanhas = relidas;
+    }
+  }
   const elegiveis = campanhas.filter(
     (c) => c.assistente_id && dentroDaJanela(agora, c.janela_horario),
   );
