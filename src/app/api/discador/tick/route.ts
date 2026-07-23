@@ -23,5 +23,8 @@ export async function GET(request: Request) {
     agora: new Date(),
   });
 
-  return NextResponse.json(resultado);
+  // Falha de consulta vira 500 (visível no histórico do agendador e no
+  // monitoramento); os demais resultados são operação normal → 200.
+  const status = resultado.acao === 'erro' ? 500 : 200;
+  return NextResponse.json(resultado, { status });
 }

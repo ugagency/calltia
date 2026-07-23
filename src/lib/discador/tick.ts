@@ -14,12 +14,31 @@ export interface TickDeps {
   agora: Date;
 }
 
+// Loga e devolve um erro de consulta como resultado do tick, para que a causa
+// apareça na resposta HTTP em vez de virar 'nada_a_fazer' silencioso.
+function erroTick(etapa: string, erro: { message?: string }): TickResultado {
+  console.error('[discador] falha na etapa', etapa, erro);
+  return { acao: 'erro', etapa, erro: erro?.message ?? 'erro desconhecido' };
+}
+
+// Diagnóstico de uma passada. Vai junto na resposta para tornar visível por
+// que o discador não discou (as duas causas de 'nada_a_fazer' — nenhuma
+// campanha elegível vs. nenhum lead — eram indistinguíveis antes disso).
+export interface DiagnosticoTick {
+  campanhasAtivas: number;
+  campanhasElegiveis: number;
+  leadsEncontrados: number;
+}
+
 export type TickResultado =
   | { acao: 'linha_ocupada' }
-  | { acao: 'nada_a_fazer' }
+  | { acao: 'nada_a_fazer'; motivo: 'sem_campanha_elegivel' | 'sem_lead'; diagnostico: DiagnosticoTick }
   | { acao: 'lead_tomado' }
   | { acao: 'discou'; leadId: string; campaignId: string; chamadaExternaId: string }
-  | { acao: 'falha_ao_discar'; leadId: string; erro: string };
+  | { acao: 'falha_ao_discar'; leadId: string; erro: string }
+  // Uma consulta ao Supabase falhou. Antes esse erro era engolido e virava
+  // 'nada_a_fazer' silencioso (mesmo antipadrão corrigido no webhook).
+  | { acao: 'erro'; etapa: string; erro: string };
 
 // Uma passada do discador. Regra central (Anatel / discagem progressiva):
 // UMA ligação por vez por linha.
@@ -41,46 +60,61 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
   // 2. Linha ocupada? Qualquer lead ainda 'discado' dentro do timeout ⇒ há
   //    uma chamada em voo; não dispara outra.
   const limiteTimeout = new Date(agora.getTime() - TIMEOUT_DISCAGEM_MIN * 60000).toISOString();
-  const { data: emVoo } = await db
+  const emVoo = await db
     .from('leads')
     .select('id')
     .eq('status', 'discado')
     .gt('ultima_discagem_em', limiteTimeout)
     .limit(1);
-  if (emVoo && emVoo.length > 0) return { acao: 'linha_ocupada' };
+  if (emVoo.error) return erroTick('consultar_em_voo', emVoo.error);
+  if (emVoo.data && emVoo.data.length > 0) return { acao: 'linha_ocupada' };
 
   // 3. Campanhas ativas, dentro da janela, com assistente já criado.
-  const { data: campanhas } = await db
-    .from('campaigns')
-    .select('*')
-    .eq('status', 'ativa');
-  const elegiveis = (campanhas ?? []).filter(
-    (c: Campaign) => c.assistente_id && dentroDaJanela(agora, c.janela_horario),
-  ) as Campaign[];
-  if (elegiveis.length === 0) return { acao: 'nada_a_fazer' };
-
-  const idsCampanha = elegiveis.map((c) => c.id);
+  const campanhasResp = await db.from('campaigns').select('*').eq('status', 'ativa');
+  if (campanhasResp.error) return erroTick('consultar_campanhas', campanhasResp.error);
+  const campanhas = (campanhasResp.data ?? []) as Campaign[];
+  const elegiveis = campanhas.filter(
+    (c) => c.assistente_id && dentroDaJanela(agora, c.janela_horario),
+  );
 
   // 4. Pega UM lead elegível (na fila, com tentativas restantes e cujo
   //    reagendamento já venceu). Mais antigos / sem agendamento primeiro.
   const agoraIso = agora.toISOString();
-  const { data: leads } = await db
-    .from('leads')
-    .select('*')
-    .in('campaign_id', idsCampanha)
-    .eq('status', 'em_fila')
-    .lt('tentativas', MAX_TENTATIVAS)
-    .or(`proximo_contato_em.is.null,proximo_contato_em.lte.${agoraIso}`)
-    .order('proximo_contato_em', { ascending: true, nullsFirst: true })
-    .order('criado_em', { ascending: true })
-    .limit(1);
+  let leads: Lead[] = [];
+  if (elegiveis.length > 0) {
+    const idsCampanha = elegiveis.map((c) => c.id);
+    const leadsResp = await db
+      .from('leads')
+      .select('*')
+      .in('campaign_id', idsCampanha)
+      .eq('status', 'em_fila')
+      .lt('tentativas', MAX_TENTATIVAS)
+      .or(`proximo_contato_em.is.null,proximo_contato_em.lte.${agoraIso}`)
+      .order('proximo_contato_em', { ascending: true, nullsFirst: true })
+      .order('criado_em', { ascending: true })
+      .limit(1);
+    if (leadsResp.error) return erroTick('consultar_leads', leadsResp.error);
+    leads = (leadsResp.data ?? []) as Lead[];
+  }
 
-  const lead = (leads ?? [])[0] as Lead | undefined;
-  if (!lead) return { acao: 'nada_a_fazer' };
+  const diagnostico: DiagnosticoTick = {
+    campanhasAtivas: campanhas.length,
+    campanhasElegiveis: elegiveis.length,
+    leadsEncontrados: leads.length,
+  };
+
+  const lead = leads[0];
+  if (!lead) {
+    return {
+      acao: 'nada_a_fazer',
+      motivo: elegiveis.length === 0 ? 'sem_campanha_elegivel' : 'sem_lead',
+      diagnostico,
+    };
+  }
 
   // 5. Reivindica o lead de forma atômica (trava otimista em status='em_fila').
   //    Se outra passada o pegou primeiro, o update não afeta linhas.
-  const { data: reivindicado } = await db
+  const reivindicacao = await db
     .from('leads')
     .update({
       status: 'discado',
@@ -92,7 +126,8 @@ export async function executarTick(deps: TickDeps): Promise<TickResultado> {
     .eq('status', 'em_fila')
     .select('id')
     .maybeSingle();
-  if (!reivindicado) return { acao: 'lead_tomado' };
+  if (reivindicacao.error) return erroTick('reivindicar_lead', reivindicacao.error);
+  if (!reivindicacao.data) return { acao: 'lead_tomado' };
 
   const campanha = elegiveis.find((c) => c.id === lead.campaign_id)!;
 
